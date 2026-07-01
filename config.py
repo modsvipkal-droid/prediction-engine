@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=False)
 
 
 class Settings:
@@ -14,6 +14,7 @@ class Settings:
     EPOCHS: int = int(os.getenv("EPOCHS", "50"))
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "32"))
     HIDDEN_SIZE: int = int(os.getenv("HIDDEN_SIZE", "64"))
+    MAX_RECORDS: int = int(os.getenv("MAX_RECORDS", "5000"))
 
 
 settings = Settings()
