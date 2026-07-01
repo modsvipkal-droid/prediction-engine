@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -10,22 +11,24 @@ from config import settings
 from database import db_manager
 from model import engine
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+)
 logger = logging.getLogger(__name__)
 
 training_lock = asyncio.Lock()
-startup_ok = False
 
 
 async def train():
     async with training_lock:
-        logger.info("Training...")
         try:
             docs = await db_manager.fetch_all()
             stats = await db_manager.get_stats()
             hourly = await db_manager.analyze_by_hour()
             streaks = await db_manager.analyze_streaks()
-            logger.info("Data: %d docs, %d red, %d green", stats["total"], stats["red"], stats["green"])
+            logger.info("Data: %d total, %d red, %d green", stats["total"], stats["red"], stats["green"])
             engine.train(docs, hourly, streaks)
             logger.info("Trained — acc=%.4f loss=%.4f samples=%d", engine.accuracy, engine.loss, engine.samples_trained)
         except Exception as e:
@@ -33,40 +36,37 @@ async def train():
 
 
 async def background_loop():
-    global startup_ok
+    last_count = await db_manager.get_count()
     while True:
         try:
             if not db_manager.is_connected:
-                logger.warning("DB not connected, reconnecting...")
                 try:
                     await db_manager.connect()
+                    last_count = await db_manager.get_count()
                 except Exception:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(15)
                     continue
             current = await db_manager.get_count()
-            if current != background_loop.last_count:
-                logger.info("New data: %d → %d", background_loop.last_count, current)
+            if current != last_count:
+                logger.info("New data: %d → %d, retraining...", last_count, current)
                 await train()
-                background_loop.last_count = current
-            if not startup_ok:
-                startup_ok = True
+                last_count = current
         except Exception as e:
-            logger.error("Bg error: %s", e)
+            logger.error("Background error: %s", e)
         await asyncio.sleep(settings.TRAIN_INTERVAL_SECONDS)
-
-
-background_loop.last_count = 0
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         await db_manager.connect()
-        background_loop.last_count = await db_manager.get_count()
-        logger.info("Connected, records: %d", background_loop.last_count)
+        logger.info("MongoDB connected successfully")
     except Exception as e:
-        logger.warning("Initial DB connect failed: %s — will retry in background", e)
-    await train()
+        logger.warning("MongoDB not available at startup: %s — will retry in background", e)
+    try:
+        await train()
+    except Exception as e:
+        logger.error("Initial training failed: %s", e)
     bg = asyncio.create_task(background_loop())
     yield
     bg.cancel()
@@ -78,7 +78,11 @@ app = FastAPI(title="AI Prediction Engine", lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "app": "AI Prediction Engine", "docs": "/dashboard"}
+    return {
+        "status": "running",
+        "db": "connected" if db_manager.is_connected else "disconnected",
+        "endpoints": {"/predict": "Get prediction", "/model-info": "Model details", "/health": "Server health", "/dashboard": "Web UI"},
+    }
 
 
 @app.get("/predict")
@@ -102,10 +106,10 @@ async def model_info():
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy" if db_manager.is_connected else "degraded",
+        "status": "ok",
         "db_connected": db_manager.is_connected,
         "total_data": engine.total_data,
-        "samples_trained": engine.samples_trained,
+        "model_trained": engine.samples_trained > 0,
     }
 
 
@@ -134,8 +138,8 @@ async def auto_predict(request: Request):
 @app.get("/dashboard")
 async def dashboard():
     html = """<!DOCTYPE html>
-<html><head><title>AI Prediction Dashboard</title>
-<meta charset="utf-8">
+<html><head><title>AI Prediction Engine</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px}
@@ -143,17 +147,20 @@ body{font-family:monospace;background:#0d1117;color:#c9d1d9;padding:20px}
 .green{color:#3fb950}.red{color:#f85149}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .badge{display:inline-block;padding:4px 12px;border-radius:12px;font-size:.9em;margin:2px}
+h1{margin-bottom:10px}
 </style></head><body>
 <h1>AI Prediction Engine</h1>
 <div id="content"><p>Loading...</p></div>
 <script>
 async function load(){try{
 const r=await fetch('/predict'),d=await r.json();
+const g=((d.probabilities?.Green||0)*100).toFixed(0);
+const rd=((d.probabilities?.Red||0)*100).toFixed(0);
 document.getElementById('content').innerHTML=`
 <div class="card">
 <div class="grid">
-<div><b>Current Period:</b> ${d.current_period||'-'}</div>
-<div><b>Next Period:</b> ${d.next_period||'-'}</div>
+<div><b>Current:</b> ${d.current_period||'-'}</div>
+<div><b>Next:</b> ${d.next_period||'-'}</div>
 </div>
 <h2>Prediction: <span class="${d.prediction==='Green'?'green':'red'}">${d.prediction||'-'}</span></h2>
 <div class="grid">
@@ -161,19 +168,19 @@ document.getElementById('content').innerHTML=`
 <div><b>Accuracy:</b> ${(d.accuracy*100).toFixed(1)}%</div>
 </div>
 <div>
-<span class="badge" style="background:#3fb95033;color:#3fb950">Green ${(d.probabilities?.Green*100||0).toFixed(0)}%</span>
-<span class="badge" style="background:#f8514933;color:#f85149">Red ${(d.probabilities?.Red*100||0).toFixed(0)}%</span>
+<span class="badge" style="background:#3fb95033;color:#3fb950">Green ${g}%</span>
+<span class="badge" style="background:#f8514933;color:#f85149">Red ${rd}%</span>
 </div>
 <p><b>Hour Pattern:</b> ${d.hourly_pattern||'-'}</p>
 <p><b>Strategy:</b></p><ul>${(d.strategy||[]).map(s=>'<li>'+s+'</li>').join('')}</ul>
 </div>
 <div class="card">
 <div class="grid">
-<div><b>Total Records:</b> ${d.total_data||0}</div>
+<div><b>Records:</b> ${d.total_data||0}</div>
 <div><b>Trained:</b> ${d.samples_trained||0}</div>
-<div><span style="color:#f85149">Red: ${d.total_red||0}</span></div>
-<div><span style="color:#3fb950">Green: ${d.total_green||0}</span></div>
-</div></div>`}catch(e){document.getElementById('content').innerHTML='<p>Error loading</p>'}}
+<div><span class="red">Red: ${d.total_red||0}</span></div>
+<div><span class="green">Green: ${d.total_green||0}</span></div>
+</div></div>`}catch(e){document.getElementById('content').innerHTML='<p>Waiting for data...</p>'}}
 load();setInterval(load,5000);
 </script></body></html>"""
     return HTMLResponse(content=html)
